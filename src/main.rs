@@ -46,7 +46,8 @@ async fn main() {
     let mut proxies = vec![];
     let concurrent: usize = args[3].parse().unwrap();
     let proxy_file_name = if args.len() == 4 { "--no-proxies" } else { args[4].as_str()};
-    if proxy_file_name == "--no-proxies" {
+    let using_proxies = proxy_file_name != "--no-proxies";
+    if !using_proxies {
         if concurrent > NO_PROXY_CONC_LIMIT {
             println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start");
             exit(1);
@@ -201,7 +202,7 @@ async fn main() {
             // slowly ramp up workers so we don't spam everything at once at the start
             let r = worker_i as f32 / concurrent as f32 * 10000.0;
             sleep(std::time::Duration::from_millis(r as u64)).await;
-            const STARTING_COOKIES: &'static str = "retina=0; over18=1; m_section=hot; m_sort=time; is_emerald=0; is_authed=0; frontpagebeta=0; postpagebeta=0;";
+            const COOKIES: &'static str = "retina=0; over18=1; m_section=hot; m_sort=time; is_emerald=0; is_authed=0; frontpagebeta=0; postpagebeta=0;";
             let client = reqwest::Client::builder()
                 .gzip(true)
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36")
@@ -224,12 +225,14 @@ async fn main() {
                     Ok(task) => {
                         let url = format!("https://imgur.com/a/{}", task);
                         let mut success = false;
-                        for _ in 0..10 {
+                        // if we're using proxies, we want the worker to fail after a few attempts
+                        // so it can release it's job
+                        // if we're not using proxies we want it to keep retrying indefinitely
+                        let attempts = if using_proxies { 10 } else { 1 << 32 };
+                        for _ in 0..attempts {
                             let req = client.get(url.as_str())
                                 .header("Referer", referer.as_str())
-                                .header("Cookie", STARTING_COOKIES);
-                            // make sure the cookies are always right
-                            //cookie_store.add_cookie_str(STARTING_COOKIES, &cookie_url);
+                                .header("Cookie", COOKIES);
                             match req
                                 .send()
                                 .await {
@@ -283,8 +286,14 @@ async fn main() {
                                             sleep(Duration::from_secs(30)).await;
                                             continue;
                                         } else if status == StatusCode::TOO_MANY_REQUESTS {
-                                            println!("Worker #{} got 429'd", worker_i);
-                                            break;
+                                            if using_proxies {
+                                                println!("Worker #{} got 429'd", worker_i);
+                                                break;
+                                            } else {
+                                                println!("Worker #{} got 429'd, sleeping 1min before retrying", worker_i);
+                                                sleep(Duration::from_secs(60)).await;
+                                                continue;
+                                            }
                                         } else if status != StatusCode::NOT_FOUND && status.as_u16() != 403 {
                                             println!("Failed to request '{}', got status {}, retrying in 30s", url, status.as_u16());
                                             sleep(Duration::from_secs(30)).await;
