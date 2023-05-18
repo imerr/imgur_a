@@ -44,11 +44,11 @@ async fn main() {
         std::process::exit(1);
     }
     let mut proxies = vec![];
-    let concurrent: usize = args[3].parse().unwrap();
     let proxy_file_name = if args.len() == 4 { "--no-proxies" } else { args[4].as_str()};
     let using_proxies = proxy_file_name != "--no-proxies";
+    let concurrent: usize = args[2].as_str().trim_start_matches("!").parse().unwrap();
     if !using_proxies {
-        if concurrent > NO_PROXY_CONC_LIMIT {
+        if !args[2].starts_with("!") && concurrent > NO_PROXY_CONC_LIMIT {
             println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start");
             exit(1);
         }
