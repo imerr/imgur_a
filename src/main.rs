@@ -49,7 +49,7 @@ async fn main() {
     let concurrent: usize = args[2].as_str().trim_start_matches("!").parse().unwrap();
     if !using_proxies {
         if !args[2].starts_with("!") && concurrent > NO_PROXY_CONC_LIMIT {
-            println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start");
+            println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start.\nIf you're really sure you want this, prefix the number with ! and I'll do it.");
             exit(1);
         }
         for _ in 0..concurrent {
