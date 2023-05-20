@@ -1,7 +1,9 @@
 [package]
 name = "imgur_a"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
+description = "Fast tool to scan for valid imgur albums for the ArchiveTeam imgur efforts (not affiliated or endorsed).\nPlease coordinate in #imgone on hackint (yes, irc) so we don't scan the same ids twice, there's enough work to go around"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,3 +16,5 @@ serde = {version = "1.0.162", features = ["derive"] }
 serde_json = "1.0.96"
 lazy_static = "1.4.0"
 atomic-counter = "1.0.1"
+
+clap = { version = "4.2.7", features = ["derive", "cargo"] }

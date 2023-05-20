@@ -1,8 +1,8 @@
-use std::env;
 use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use atomic_counter::AtomicCounter;
+use clap::Parser;
 use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::{Proxy, StatusCode};
@@ -14,6 +14,31 @@ use tokio::task;
 use tokio::task::{JoinSet};
 use tokio::time::sleep;
 use serde::Deserialize;
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Where to read ids from
+    #[arg(short, long)]
+    pub input_file: String,
+    /// Where to save found results
+    #[arg(short, long)]
+    pub results_file: String,
+    /// This specifies an optional list of http proxies to use
+    /// Proxy list file has the format of 'PROXY_HOST:PROXY_PORT:PROXY_USER:PROXY_PASSWORD' with one entry per line
+    /// So for example 'proxy.example.com:1234:username:password123'
+    /// For each entry, one worker will be spawned.
+    #[arg(short, long, verbatim_doc_comment)]
+    pub proxy_file: Option<String>,
+
+    ///  How many requests to queue per second (actual rate will be slightly lower)
+    #[arg(short, long, default_value_t = 3)]
+    pub concurrent: usize,
+    /// Bypass concurrency sanity check
+    #[arg(long, default_value_t = false)]
+    pub concurrent_unsafe: bool,
+}
 
 #[derive(Deserialize)]
 struct AlbumImages {
@@ -29,35 +54,76 @@ struct Album {
 
 const NO_PROXY_CONC_LIMIT: usize = 6;
 
+
+struct ResultsFile {
+    writer: BufWriter<File>,
+}
+
+impl ResultsFile {
+    pub async fn open(path: &str) -> ResultsFile {
+        match OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(path).await {
+            Ok(filef) => {
+                return ResultsFile {
+                    writer: BufWriter::new(filef)
+                };
+            }
+            Err(e) => {
+                println!("Failed to open results file '{}': {}", path, e);
+                exit(1)
+            }
+        }
+    }
+
+    pub async fn write(&mut self, found: &str) -> bool {
+        match self.writer.write_all(found.as_bytes()).await {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Failed to write result to results file: {}", e);
+                return false;
+            }
+        }
+        if !found.ends_with("\n") {
+            match self.writer.write_all(b"\n").await {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Failed to write result to results file: {}", e);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    pub async fn close(mut self) {
+        match self.writer.flush().await {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Failed to close results file after being done: {}", e);
+                return;
+            }
+        }
+        match self.writer.into_inner().shutdown().await {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Failed to close results file after being done: {}", e);
+                return;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 4 && args.len() != 5 {
-        println!("Usage: imgur_a <links_file> <output> <concurrent> [<proxies=--no-proxies>]");
-        println!("\tlinks_file: Path to the file with ids to work off, one id per line (just the aBcDe id, not a link)");
-        println!("\toutput: Path to the output file, will be appended to");
-        println!("\tconcurrent: How many requests to queue per second max. (actual rate will be slightly lower). If not using proxies this is limited to {}", NO_PROXY_CONC_LIMIT);
-        println!("\tproxies: Proxy list file or --no-proxies (default) to not use proxies");
-        println!("\t         Proxy list file has the format of 'PROXY_HOST:PROXY_PORT:PROXY_USER:PROXY_PASSWORD' with one entry per line");
-        println!("\t         So for example 'proxy.example.com:1234:username:password123'");
-        println!("\t         For each entry, one worker will be spawned.");
-        std::process::exit(1);
-    }
+    let args = Arc::new(Args::parse());
     let mut proxies = vec![];
-    let proxy_file_name = if args.len() == 4 { "--no-proxies" } else { args[4].as_str()};
-    let using_proxies = proxy_file_name != "--no-proxies";
-    let concurrent: usize = args[2].as_str().trim_start_matches("!").parse().unwrap();
-    if !using_proxies {
-        if !args[2].starts_with("!") && concurrent > NO_PROXY_CONC_LIMIT {
-            println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start.\nIf you're really sure you want this, prefix the number with ! and I'll do it.");
-            exit(1);
-        }
-        for _ in 0..concurrent {
-            proxies.push(Proxy::custom(|_| -> Option<&'static str> { None }));
-        }
-    } else {
+    let using_proxies = args.proxy_file.is_some();
+    if let Some(proxy_file) = &args.proxy_file {
         // read proxies:
-        match File::open(args[3].as_str()).await {
+        match File::open(proxy_file).await {
             Ok(file) => {
                 let reader = BufReader::new(file);
 
@@ -92,32 +158,37 @@ async fn main() {
                             }
                         }
                         Err(e) => {
-                            println!("Failed to read line from proxy file '{}': {}", args[4], e);
+                            println!("Failed to read line from proxy file '{}': {}", proxy_file, e);
                             std::process::exit(1);
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("Failed to open file '{}': {}", args[4], e);
+                println!("Failed to open file '{}': {}", proxy_file, e);
                 std::process::exit(1);
             }
         }
+    } else {
+        if !args.concurrent_unsafe && args.concurrent > NO_PROXY_CONC_LIMIT {
+            println!("Concurrency seems to be set too high for a single ip. (max. {NO_PROXY_CONC_LIMIT}), refusing to start.\nIf you're really sure you want this, use --concurrent-unsafe and I'll do it.");
+            exit(1);
+        }
+        for _ in 0..args.concurrent {
+            proxies.push(Proxy::custom(|_| -> Option<&'static str> { None }));
+        }
     }
-    //
-    let links_file = Arc::new(args[1].clone());
-    let out_file = Arc::new(args[2].clone());
-    let (producer, consumer) = async_channel::bounded(concurrent + 2);
+    let (producer, consumer) = async_channel::bounded(args.concurrent + 2);
     let producer = Arc::new(producer);
     let consumer = Arc::new(consumer);
-    let (requeue_tx, mut requeue_rx) = mpsc::channel(concurrent * 10);
+    let (requeue_tx, mut requeue_rx) = mpsc::channel(args.concurrent * 10);
     let requeue_tx = Arc::new(requeue_tx);
     let mut tasks = JoinSet::<()>::new();
     {
         let producer = producer.clone();
-        let links_file = links_file.clone();
+        let args = args.clone();
         tasks.spawn(async move {
-            match File::open(links_file.as_str()).await {
+            match File::open(args.input_file.as_str()).await {
                 Ok(file) => {
                     let reader = BufReader::new(file);
 
@@ -154,8 +225,8 @@ async fn main() {
                                         }
                                     }
                                     dispatched += 1;
-                                    while dispatched >= concurrent {
-                                        dispatched -= concurrent;
+                                    while dispatched >= args.concurrent {
+                                        dispatched -= args.concurrent;
                                         sleep(Duration::from_secs(1)).await;
                                     }
                                 } else {
@@ -165,14 +236,14 @@ async fn main() {
                                 }
                             }
                             Err(e) => {
-                                println!("Failed to read line from file '{}': {}", links_file, e);
+                                println!("Failed to read line from file '{}': {}", args.input_file, e);
                                 producer.close();
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    println!("Failed to open file '{}': {}", links_file, e);
+                    println!("Failed to open file '{}': {}", args.input_file, e);
                     producer.close();
                 }
             }
@@ -180,7 +251,7 @@ async fn main() {
             producer.close();
         });
     }
-    let (done_tx, mut done_rx) = mpsc::channel(concurrent * 10);
+    let (done_tx, mut done_rx) = mpsc::channel(args.concurrent * 10);
     let done_tx = Arc::new(done_tx);
     let tasks_worked = Arc::new(atomic_counter::RelaxedCounter::new(0));
     let tasks_found = Arc::new(atomic_counter::RelaxedCounter::new(0));
@@ -189,6 +260,7 @@ async fn main() {
     let start = Instant::now();
     let mut worker_counter = 0;
     for proxy in proxies {
+        // surely there has to be a better way.. smh
         let tasks_worked = tasks_worked.clone();
         let tasks_found = tasks_found.clone();
         let tasks_failed = tasks_failed.clone();
@@ -196,11 +268,13 @@ async fn main() {
         let done_tx = done_tx.clone();
         let requeue_tx = requeue_tx.clone();
         let workers_failed = workers_failed.clone();
+        let args = args.clone();
+
         worker_counter += 1;
         let worker_i = worker_counter;
         tasks.spawn(async move {
             // slowly ramp up workers so we don't spam everything at once at the start
-            let r = worker_i as f32 / concurrent as f32 * 10000.0;
+            let r = worker_i as f32 / args.concurrent as f32 * 10000.0;
             sleep(std::time::Duration::from_millis(r as u64)).await;
             const COOKIES: &'static str = "retina=0; over18=1; m_section=hot; m_sort=time; is_emerald=0; is_authed=0; frontpagebeta=0; postpagebeta=0;";
             let client = reqwest::Client::builder()
@@ -228,8 +302,10 @@ async fn main() {
                         // if we're using proxies, we want the worker to fail after a few attempts
                         // so it can release it's job
                         // if we're not using proxies we want it to keep retrying indefinitely
-                        let attempts = if using_proxies { 10 } else { 1 << 32 };
-                        for _ in 0..attempts {
+                        let mut attempts: usize = if using_proxies { 10 } else { 1 << 32 };
+                        let mut i = 0usize;
+                        while i < attempts {
+                            i += 1;
                             let req = client.get(url.as_str())
                                 .header("Referer", referer.as_str())
                                 .header("Cookie", COOKIES);
@@ -294,7 +370,21 @@ async fn main() {
                                                 sleep(Duration::from_secs(60)).await;
                                                 continue;
                                             }
-                                        } else if status != StatusCode::NOT_FOUND && status.as_u16() != 403 {
+                                        } else if status == StatusCode::FORBIDDEN {
+                                            if let Ok(text) = res.text().await {
+                                                if text.contains("Imgur is temporarily over capacity") {
+                                                    println!("Worker #{}: got 403 over-capacity, retrying in 2s", worker_i);
+                                                    sleep(Duration::from_secs(1)).await;
+                                                    attempts += 1; // increase attempts as 403 over capacity doesnt count..
+                                                    continue;
+                                                }
+                                            } else {
+                                                println!("Failed to request '{}', got status {} and couldn't read body, retrying in 30s", url, status.as_u16());
+                                                sleep(Duration::from_secs(30)).await;
+                                                continue;
+                                            }
+                                            // other 403's are expected
+                                        } else if status != StatusCode::NOT_FOUND {
                                             println!("Failed to request '{}', got status {}, retrying in 30s", url, status.as_u16());
                                             sleep(Duration::from_secs(30)).await;
                                             continue;
@@ -315,7 +405,7 @@ async fn main() {
                                     } else {
                                         tasks_failed.inc();
                                     }
-                                    if worked % concurrent == 0 {
+                                    if worked % args.concurrent == 0 {
                                         let found = tasks_found.get();
                                         let failed = tasks_failed.get();
                                         let elapsed = start.elapsed();
@@ -355,46 +445,16 @@ async fn main() {
     }
     drop(done_tx);
     let result_task = task::spawn(async move {
-        match OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(out_file.as_str()).await {
-            Ok(mut file) => {
-                let mut file = BufWriter::new(&mut file);
-                loop {
-                    if let Some(found) = done_rx.recv().await {
-                        match file.write_all(found.as_bytes()).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("Failed to write result to results file '{}': {}", out_file, e);
-                                return;
-                            }
-                        }
-                        if found.as_bytes()[found.len() - 1] != b'\n' {
-                            match file.write_all(b"\n").await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("Failed to write result to results file '{}': {}", out_file, e);
-                                    return;
-                                }
-                            }
-                        }
-                    } else {
-                        match file.shutdown().await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("Failed to close results file after being done '{}': {}", out_file, e);
-                                return;
-                            }
-                        }
-                        println!("Finished writing results");
-                        return; // channel closed
-                    }
+        let mut file = ResultsFile::open(args.results_file.as_str()).await;
+        loop {
+            if let Some(found) = done_rx.recv().await {
+                if !file.write(found.as_str()).await {
+                    break;
                 }
-            }
-            Err(e) => {
-                println!("Failed to open results file '{}': {}", out_file, e);
+            } else {
+                file.close().await;
+                println!("Finished writing results");
+                return; // channel closed
             }
         }
     });
