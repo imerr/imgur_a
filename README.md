@@ -8,14 +8,19 @@ Takes a list of ids to work off of, so please coordinate in [#imgone on hackint]
 
 # Usage
 ```
-Usage: imgur_a <links_file> <output> <concurrent> [<proxies=--no-proxies>]
-	links_file: Path to the file with ids to work off, one id per line (just the aBcDe id, not a link)
-	output: Path to the output file, will be appended to
-	concurrent: How many requests to queue per second max. (actual rate will be slightly lower). If not using proxies this is limited to 6
-	proxies: Proxy list file or --no-proxies (default) to not use proxies
-	         Proxy list file has the format of 'PROXY_HOST:PROXY_PORT:PROXY_USER:PROXY_PASSWORD' with one entry per line
-	         So for example 'proxy.example.com:1234:username:password123'
-	         For each entry, one worker will be spawned.
+Usage: imgur_a [OPTIONS] -i <INPUT_FILE> -r <RESULTS_FILE>
+
+Options:
+  -i, --input-file <INPUT_FILE>      Where to read ids from
+  -r, --results-file <RESULTS_FILE>  Where to save found results
+  -p, --proxy-file <PROXY_FILE>      This specifies an optional list of http proxies to use
+                                     Proxy list file has the format of 'PROXY_HOST:PROXY_PORT:PROXY_USER:PROXY_PASSWORD' with one entry per line
+                                     So for example 'proxy.example.com:1234:username:password123'
+                                     For each entry, one worker will be spawned.
+  -c, --concurrent <CONCURRENT>      How many requests to queue per second (actual rate will be slightly lower) [default: 3]
+      --concurrent-unsafe            Bypass concurrency sanity check
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 # Building
