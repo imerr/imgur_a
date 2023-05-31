@@ -1,19 +1,21 @@
 use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 use atomic_counter::AtomicCounter;
-use clap::Parser;
+use clap::{crate_version, Parser};
 use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::{Proxy, StatusCode};
 use reqwest::redirect::Policy;
+use serde::{Deserialize, Serialize};
+use serde::de::IgnoredAny;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::{mpsc};
+use tokio::sync::mpsc;
 use tokio::task;
-use tokio::task::{JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
-use serde::Deserialize;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -38,18 +40,53 @@ struct Args {
     /// Bypass concurrency sanity check
     #[arg(long, default_value_t = false)]
     pub concurrent_unsafe: bool,
+    /// Use the old-style web page to fetch albums instead of the api
+    #[arg(long, default_value_t = false)]
+    pub use_web: bool,
+
+    /// If used, results will not be reported automatically
+    #[arg(short, long, default_value_t = false)]
+    pub offline: bool,
+
+    /// Url to an alternative result tracker, results are POST'ed to the url with a json body
+    /// in the format of {"albums_found": ["AsDfgHi", "7654321", "1234567", ...]}
+    /// Defaults to nicolas17's tracker
+    #[arg(long, verbatim_doc_comment)]
+    pub online_tracker_url: Option<String>,
+
+    /// If set, it will submit all album results instead of only ones at risk of deletion
+    /// (other api responses will still be saved to the results file)
+    #[arg(short, long, default_value_t = false)]
+    pub online_submit_all: bool,
 }
 
 #[derive(Deserialize)]
-struct AlbumImages {
+struct WebAlbumImages {
     count: usize,
 }
 
 #[derive(Deserialize)]
-struct Album {
+struct WebAdConfig {
+    nsfw_score: i64,
+}
+
+#[derive(Deserialize)]
+struct WebAlbum {
     title: Option<String>,
     description: Option<String>,
-    album_images: Option<AlbumImages>,
+    album_images: Option<WebAlbumImages>,
+    account_id: Option<IgnoredAny>,
+    #[serde(rename = "adConfig")]
+    ad_config: WebAdConfig,
+}
+
+#[derive(Deserialize)]
+struct ApiAlbum {
+    media: Option<Vec<IgnoredAny>>,
+    account_id: usize,
+    title: String,
+    description: String,
+    is_mature: bool,
 }
 
 const NO_PROXY_CONC_LIMIT: usize = 6;
@@ -57,6 +94,67 @@ const NO_PROXY_CONC_LIMIT: usize = 6;
 
 struct ResultsFile {
     writer: BufWriter<File>,
+}
+
+#[derive(Serialize, Debug)]
+struct ResultsTrackerBuffer {
+    pub albums_found: Vec<String>,
+}
+
+struct ResultsTracker {
+    client: reqwest::Client,
+    url: String,
+    buffer: ResultsTrackerBuffer,
+    last_send: Instant,
+}
+
+const TRACKER_SEND_INTERVAL: Duration = Duration::from_secs(30);
+const TRACKER_SEND_LIMIT: usize = 1000;
+
+impl ResultsTracker {
+    pub fn new(url: Option<String>) -> ResultsTracker {
+        ResultsTracker {
+            client: reqwest::ClientBuilder::new().user_agent(format!("imgur_a/{}", crate_version!())).build().unwrap(),
+            url: url.unwrap_or(String::from("https://data.nicolas17.xyz/imgur-bruteforce/report")),
+            buffer: ResultsTrackerBuffer { albums_found: vec![] },
+            last_send: Instant::now(),
+        }
+    }
+
+    pub async fn report(&mut self, id: String) {
+        self.buffer.albums_found.push(id);
+        if self.last_send.elapsed() > TRACKER_SEND_INTERVAL ||
+            self.buffer.albums_found.len() >= TRACKER_SEND_LIMIT {
+            self.send().await;
+        }
+    }
+
+    async fn send(&mut self) {
+        loop {
+            match self.client.post(&self.url).json(&self.buffer).send().await {
+                Ok(res) => {
+                    if !res.status().is_success() {
+                        println!("Failed to submit results to the tracker, got non-2oo status {}. Retrying in 2s. Response: {}\n", res.status().as_u16(), res.text().await.unwrap_or(String::from("n/a")));
+                    } else {
+                        println!("Reported {} to the tracker.", self.buffer.albums_found.len());
+                        break;
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to submit results to the tracker: {}. Retrying in 2s", e);
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+        self.last_send = Instant::now();
+        self.buffer.albums_found.clear();
+    }
+
+    pub async fn close(mut self) {
+        if self.buffer.albums_found.len() > 0 {
+            self.send().await;
+        }
+    }
 }
 
 impl ResultsFile {
@@ -276,7 +374,7 @@ async fn main() {
             // slowly ramp up workers so we don't spam everything at once at the start
             let r = worker_i as f32 / args.concurrent as f32 * 10000.0;
             sleep(std::time::Duration::from_millis(r as u64)).await;
-            const COOKIES: &'static str = "retina=0; over18=1; m_section=hot; m_sort=time; is_emerald=0; is_authed=0; frontpagebeta=0; postpagebeta=0;";
+            const COOKIES_WEB: &'static str = "retina=0; over18=1; m_section=hot; m_sort=time; is_emerald=0; is_authed=0; frontpagebeta=0; postpagebeta=0;";
             let client = reqwest::Client::builder()
                 .gzip(true)
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36")
@@ -292,12 +390,17 @@ async fn main() {
                 return;
             }
             let client = client.unwrap();
-            let mut referer = String::from("https://imgur.com/");
-            //let cookie_url = "https://imgur.com".parse().unwrap();
             loop {
                 match consumer.recv().await {
                     Ok(task) => {
-                        let url = format!("https://imgur.com/a/{}", task);
+                        let mut referer = String::from("https://imgur.com/");
+                        let url;
+                        if args.use_web {
+                            url = format!("https://imgur.com/a/{}", task);
+                        } else {
+                            url = format!("https://api.imgur.com/post/v1/albums/{}?client_id=546c25a59c58ad7&include=media%2Cadconfig%2Caccount", task);
+                            referer = format!("https://imgur.com/a/{}", task);
+                        }
                         let mut success = false;
                         // if we're using proxies, we want the worker to fail after a few attempts
                         // so it can release it's job
@@ -306,39 +409,56 @@ async fn main() {
                         let mut i = 0usize;
                         while i < attempts {
                             i += 1;
-                            let req = client.get(url.as_str())
-                                .header("Referer", referer.as_str())
-                                .header("Cookie", COOKIES);
+                            let mut req = client.get(url.as_str())
+                                .header("Referer", referer.as_str());
+                            if args.use_web {
+                                req = req.header("Cookie", COOKIES_WEB);
+                            }
+
                             match req
                                 .send()
                                 .await {
                                 Ok(res) => {
-                                    //println!("{}: {}", url, res.status());
                                     let worked = tasks_worked.inc() + 1;
                                     let status = res.status();
                                     let mut result = None;
                                     if status.is_success() {
                                         match res.text().await {
                                             Ok(body) => {
-                                                lazy_static! {
-                                                    static ref RE: Regex = Regex::new("(?msi)<script.*image\\s*:\\s?(\\{.*?\\}),\r?\n.*?</script>").unwrap();
-                                                }
-                                                if let Some(json_match) = RE.captures(body.as_str()) {
-                                                    let d = json_match.get(1).unwrap().as_str();
-                                                    match serde_json::from_str::<Album>(d) {
+                                                if args.use_web {
+                                                    lazy_static! {
+                                                        static ref RE: Regex = Regex::new("(?msi)<script.*image\\s*:\\s?(\\{.*?\\}),\r?\n.*?</script>").unwrap();
+                                                    }
+                                                    if let Some(json_match) = RE.captures(body.as_str()) {
+                                                        let d = json_match.get(1).unwrap().as_str();
+                                                        match serde_json::from_str::<WebAlbum>(d) {
+                                                            Ok(data) => {
+                                                                if (data.album_images.is_some() && data.album_images.unwrap().count > 0) || !data.title.unwrap_or(String::new()).is_empty() || !data.description.unwrap_or(String::new()).is_empty() {
+                                                                    result = Some((d.to_string(), data.account_id.is_none() || data.ad_config.nsfw_score > 0));
+                                                                } else {
+                                                                    result = None;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                println!("Failed to parse response json for {}: {}. Json: {}", url, e, d);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        println!("Failed to find album data in response for {}:\n{}", url, body);
+                                                    }
+                                                } else {
+                                                    match serde_json::from_str::<ApiAlbum>(body.as_str()) {
                                                         Ok(data) => {
-                                                            if (data.album_images.is_some() && data.album_images.unwrap().count > 0) || !data.title.unwrap_or(String::new()).is_empty() || !data.description.unwrap_or(String::new()).is_empty() {
-                                                                result = Some(d.to_string());
+                                                            if (data.media.is_some() && data.media.unwrap().len() > 0) || !data.title.is_empty() || !data.description.is_empty() {
+                                                                result = Some((body, data.account_id == 0 || data.is_mature));
                                                             } else {
                                                                 result = None;
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            println!("Failed to parse response json for {}: {}. Json: {}", url, e, d);
+                                                            println!("Failed to parse response json for {}: {}. Json: {}", url, e, body);
                                                         }
                                                     }
-                                                } else {
-                                                    println!("Failed to find album data in response for {}:\n{}", url, body);
                                                 }
                                             }
                                             Err(e) => {
@@ -393,9 +513,9 @@ async fn main() {
                                         }
                                     }
                                     success = true;
-                                    if let Some(body) = result {
+                                    if let Some((body, at_risk)) = result {
                                         tasks_found.inc();
-                                        match done_tx.send(body).await {
+                                        match done_tx.send((task.clone(), body, at_risk)).await {
                                             Ok(_) => {}
                                             Err(e) => {
                                                 println!("Failed to send result {}", e);
@@ -430,8 +550,6 @@ async fn main() {
                             workers_failed.inc();
                             println!("Worker #{} is done. (has failed)", worker_i);
                             return;
-                        } else {
-                            referer = url;
                         }
                     }
                     Err(_) => {
@@ -446,13 +564,25 @@ async fn main() {
     drop(done_tx);
     let result_task = task::spawn(async move {
         let mut file = ResultsFile::open(args.results_file.as_str()).await;
+        let mut result_tracker = None;
+        if !args.offline {
+            result_tracker = Some(ResultsTracker::new(args.online_tracker_url.clone()));
+        }
         loop {
-            if let Some(found) = done_rx.recv().await {
-                if !file.write(found.as_str()).await {
+            if let Some((task, data, is_at_risk)) = done_rx.recv().await {
+                if !file.write(data.as_str()).await {
                     break;
+                }
+                if !args.offline && (is_at_risk || args.online_submit_all) {
+                    if let Some(tracker) = result_tracker.as_mut() {
+                        tracker.report(task).await;
+                    }
                 }
             } else {
                 file.close().await;
+                if let Some(tracker) = result_tracker {
+                    tracker.close().await;
+                }
                 println!("Finished writing results");
                 return; // channel closed
             }
